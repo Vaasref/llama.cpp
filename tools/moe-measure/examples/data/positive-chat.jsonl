@@ -1,0 +1,1 @@
+{"messages":[{"role":"system","content":"Answer accurately and concisely."},{"role":"user","content":"Why does the sky appear blue during the day?"},{"role":"assistant","content":"Shorter blue wavelengths are scattered more strongly by molecules in the atmosphere, so blue light reaches our eyes from many directions."}],"enable_thinking":false,"add_generation_prompt":false}

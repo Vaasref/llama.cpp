@@ -1,0 +1,2 @@
+Explain difficult ideas clearly, preserve factual details, and answer in natural prose.
+Summarize arguments, compare alternatives, and follow the requested output format.

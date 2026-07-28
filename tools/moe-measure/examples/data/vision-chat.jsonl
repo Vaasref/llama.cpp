@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":[{"type":"text","text":"Describe the main objects and their spatial relationships in this image."},{"type":"image_url","image_url":{"url":"file://test-1.jpeg"}}]}],"add_generation_prompt":false,"enable_thinking":false}
