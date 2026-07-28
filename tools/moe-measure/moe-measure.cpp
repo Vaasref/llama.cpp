@@ -60,6 +60,7 @@ struct measure_options {
     std::vector<std::string> measured_vocab_files;
     std::vector<std::string> excluded_vocab_files;
     bool                     exclude_special_tokens   = false;
+    bool                     parse_special            = true;
     bool                     normalize_router_weights = true;
     std::string              chat_template;
     std::string              chat_template_file;
@@ -92,6 +93,7 @@ void print_usage(const char * argv0) {
     LOG("  --measured-vocab FILE       allow token IDs listed in FILE (repeatable)\n");
     LOG("  --excluded-vocab FILE       deny token IDs listed in FILE (repeatable)\n");
     LOG("  --exclude-special-tokens    deny non-text vocabulary tokens\n");
+    LOG("  --no-parse-special          treat special-token spellings as ordinary text\n");
     LOG("  -np, --parallel N           parallel measurement slots (default 1)\n");
     LOG("  -c, --ctx-size N            context tokens per measurement slot (default 512)\n");
     LOG("  -b, --batch-size N          logical token limit shared by active slots\n");
@@ -140,6 +142,14 @@ bool parse_custom_args(int                   argc,
         if (arg == "--exclude-special-tokens") {
             options.exclude_special_tokens = true;
             continue;
+        }
+        if (arg == "--no-parse-special") {
+            options.parse_special = false;
+            continue;
+        }
+        if (arg == "--parse-special") {
+            error = "--parse-special was removed because special-token parsing is enabled by default";
+            return false;
         }
         if (arg == "--text" || arg == "--chat" || arg == "--input-jsonl" || arg == "--prefix-output" ||
             arg == "--measured-vocab" || arg == "--excluded-vocab" || arg == "--router-weights" ||
@@ -2472,9 +2482,10 @@ int main(int argc, char ** argv) {
     }
 
     common_params params;
-    params.n_ctx    = 512;
-    params.escape   = false;
-    params.warmup   = false;
+    params.n_ctx         = 512;
+    params.escape        = false;
+    params.warmup        = false;
+    params.parse_special = options.parse_special;
     moe_measure_collector collector;
     params.cb_eval                     = collector_callback;
     params.cb_eval_user_data           = &collector;

@@ -34,6 +34,14 @@ int main(int argc, char ** argv) {
     REQUIRE(output.find("model, output, context size, and parallel slot count are required") != std::string::npos);
     REQUIRE(!std::filesystem::exists(root / "measurement.moem"));
 
+    const std::string help_command =
+        "\"" + std::string(argv[1]) + "\" --help > \"" + log.string() + "\" 2>&1";
+    REQUIRE(std::system(help_command.c_str()) == 0);
+    std::ifstream help_input(log);
+    const std::string help_output(
+        (std::istreambuf_iterator<char>(help_input)), std::istreambuf_iterator<char>());
+    REQUIRE(help_output.find("--no-parse-special") != std::string::npos);
+
     const std::string list_command =
         "\"" + std::string(argv[1]) + "\" --list-devices > \"" + log.string() + "\" 2>&1";
     REQUIRE(std::system(list_command.c_str()) == 0);

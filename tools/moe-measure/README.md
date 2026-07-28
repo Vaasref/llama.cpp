@@ -100,10 +100,13 @@ Allow files form a union; without one, all vocabulary IDs start enabled. Deny fi
 union and override the allowlist. `--exclude-special-tokens` denies control, EOG,
 user-defined, unknown, and unused tokens while leaving normal and byte tokens eligible.
 The mask applies to `--text`, `--chat`, and paired inputs, but rejected tokens are still
-decoded causally. Projected image rows are never filtered. Use the common
-`--parse-special` option when externally rendered special-token spellings should tokenize
-as their special IDs. Template artifacts represented by normal pieces need an explicit
-denylist.
+decoded causally. Projected image rows are never filtered. Special-token parsing is
+enabled by default, so externally rendered model-specific BOS, EOS, and chat-control
+spellings tokenize as their special IDs when the vocabulary defines them.
+`--no-parse-special` is available only for compatibility or tokenizer diagnosis. A
+spelling such as `</s>` is not universal: if the model does not define it as a special
+token, it remains ordinary text. Template artifacts represented by normal pieces need an
+explicit denylist.
 
 Text files are joined with newline separators and tokenized once. Chat files are JSONL;
 each non-empty line must contain an OpenAI-compatible `messages` array and may contain
