@@ -1,3 +1,9 @@
+> [!WARNING]
+>
+> This repository is an experimental, independently maintained personal fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). Its changes are shared for reference and use, but are not intended for submission to or merging into upstream llama.cpp.
+>
+> Use the [official llama.cpp repository](https://github.com/ggml-org/llama.cpp) for upstream releases, support, and contribution guidance. The badges, links, and documentation retained below may describe the upstream project rather than this fork. This repository is read-only for code contributions: pull requests are not accepted, but issues about behavior specific to this fork are welcome.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
