@@ -83,6 +83,7 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader &) {
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
+        const int64_t n_expert_layer = hparams.n_expert_for_layer(i);
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
         if (q_lora_rank > 0) {
@@ -117,10 +118,10 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader &) {
             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
         } else {
-            layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert_layer}, 0);
+            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert_layer}, TENSOR_NOT_REQUIRED);
 
-            if (n_expert == 0) {
+            if (n_expert_layer == 0) {
                 throw std::runtime_error("n_expert must be > 0");
             }
             if (n_expert_used == 0) {
@@ -128,8 +129,8 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader &) {
             }
 
             // MoE branch
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
-            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert_layer}, 0);
+            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert_layer, 0);
 
             // Shared expert branch
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
@@ -383,6 +384,9 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
+            const int64_t n_expert_layer = hparams.n_expert_for_layer(il);
+            const int64_t n_expert_used_layer = cparams.warmup ? n_expert_layer : n_expert_used;
+
             // MoE branch
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
@@ -390,7 +394,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 model.layers[il].ffn_gate_exps,
                 model.layers[il].ffn_down_exps,
                 model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
+                n_expert_layer, n_expert_used_layer,
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,

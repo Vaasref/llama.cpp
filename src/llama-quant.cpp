@@ -1370,6 +1370,7 @@ llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * des
         model->hparams.n_head_arr[i]    = desc->n_head;
         model->hparams.n_head_kv_arr[i] = desc->n_head_kv;
         model->hparams.n_ff_arr[i]      = desc->n_ff;
+        model->hparams.n_expert_arr[i]  = desc->n_expert;
     }
 
     return model;

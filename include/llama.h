@@ -403,6 +403,9 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool expert_output_capture;      // [EXPERIMENTAL] expose reduced MoE expert outputs to cb_eval
         bool expert_output_capture_only; // [EXPERIMENTAL] capture all rows and omit logits
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        bool moe_routing_temperature;    // enable per-sequence seeded MoE router-logit scaling
+#endif
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

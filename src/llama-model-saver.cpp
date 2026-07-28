@@ -218,7 +218,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,                hparams.swiglu_clamp_shexp);
     add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,             hparams.use_par_res);
     // add_kv(LLM_KV_TENSOR_DATA_LAYOUT,                ???);
-    add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert);
+    add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert_arr, true);
     add_kv(LLM_KV_EXPERT_USED_COUNT,                 hparams.n_expert_used);
     add_kv(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
     add_kv(LLM_KV_EXPERT_GROUP_COUNT,                hparams.n_expert_groups);

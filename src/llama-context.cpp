@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -140,6 +141,9 @@ llama_context::llama_context(
     cparams.cb_eval_row_order_user_data = params.cb_eval_row_order_user_data;
     cparams.expert_output_capture       = params.expert_output_capture;
     cparams.expert_output_capture_only  = params.expert_output_capture_only;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    cparams.moe_routing_temperature     = params.moe_routing_temperature;
+#endif
 
     cparams.ctx_other = nullptr;
 
@@ -1259,6 +1263,58 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+llama_moe_routing_temperature_config llama_moe_routing_temperature_config_init(
+        uint32_t n_layer,
+        uint32_t n_expert,
+           float temperature,
+        uint32_t seed) {
+    GGML_ASSERT(n_layer > 0);
+    GGML_ASSERT(n_expert > 0);
+    GGML_ASSERT(std::isfinite(temperature) && temperature >= 0.0f);
+
+    llama_moe_routing_temperature_config config = {
+        /*.n_layer  =*/ n_layer,
+        /*.n_expert =*/ n_expert,
+        /*.factors  =*/ std::vector<float>((size_t) n_layer * n_expert),
+    };
+
+    std::mt19937 rng(seed);
+    const double scale = 1.0 / ((double) std::mt19937::max() + 1.0);
+    for (float & factor : config.factors) {
+        const float uniform = (float) ((double) rng() * scale);
+        factor = 1.0f + temperature * uniform;
+    }
+
+    return config;
+}
+
+bool llama_context::set_moe_routing_temperature(llama_seq_id seq_id, float temperature, uint32_t seed) {
+    if (!cparams.moe_routing_temperature) {
+        LLAMA_LOG_ERROR("%s: MoE routing temperature is not enabled for this context\n", __func__);
+        return false;
+    }
+    if (seq_id < 0 || !std::isfinite(temperature) || temperature < 0.0f) {
+        LLAMA_LOG_ERROR("%s: invalid sequence or temperature\n", __func__);
+        return false;
+    }
+
+    const auto & hparams = model.hparams;
+    if (hparams.n_expert == 0 || hparams.n_layer_all == 0) {
+        LLAMA_LOG_ERROR("%s: model has no routed experts\n", __func__);
+        return false;
+    }
+
+    moe_routing_temperature[seq_id] = llama_moe_routing_temperature_config_init(
+        hparams.n_layer_all, hparams.n_expert, temperature, seed);
+    return true;
+}
+
+void llama_context::clear_moe_routing_temperature(llama_seq_id seq_id) {
+    moe_routing_temperature.erase(seq_id);
+}
+#endif
+
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -1399,6 +1455,17 @@ int llama_context::encode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    if (cparams.moe_routing_temperature && batch_inp.n_seq_id) {
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if (batch_inp.n_seq_id[i] != 1) {
+                LLAMA_LOG_ERROR("%s: MoE routing temperature requires exactly one sequence per token\n", __func__);
+                return -1;
+            }
+        }
+    }
+#endif
 
     const auto & hparams = model.hparams;
 
@@ -1708,6 +1775,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    if (cparams.moe_routing_temperature && batch_inp.n_seq_id) {
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if (batch_inp.n_seq_id[i] != 1) {
+                LLAMA_LOG_ERROR("%s: MoE routing temperature requires exactly one sequence per token\n", __func__);
+                return -1;
+            }
+        }
+    }
+#endif
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -2441,6 +2519,9 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        /*.moe_routing_temperature =*/ &moe_routing_temperature,
+#endif
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3514,6 +3595,9 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.expert_output_capture       =*/ false,
         /*.expert_output_capture_only  =*/ false,
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        /*.moe_routing_temperature     =*/ false,
+#endif
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3771,6 +3855,17 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
 }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+bool llama_set_moe_routing_temperature(
+        llama_context * ctx, llama_seq_id seq_id, float temperature, uint32_t seed) {
+    return ctx->set_moe_routing_temperature(seq_id, temperature, seed);
+}
+
+void llama_clear_moe_routing_temperature(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->clear_moe_routing_temperature(seq_id);
+}
+#endif
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();

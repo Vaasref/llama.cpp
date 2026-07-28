@@ -589,9 +589,18 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    size_t logits_n_tokens = 0;
+    std::vector<float> logits;
+#endif
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        logits_n_tokens = 0;
+        logits.clear();
+#endif
     }
 
     int n_tokens() const {
@@ -602,6 +611,10 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            logits_n_tokens,
+            logits,
+#endif
         };
     }
 };
@@ -621,6 +634,9 @@ struct server_prompt_cache_state {
 
     size_t size() const {
         size_t res = data.size();
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        res += prompt.logits.size() * sizeof(float);
+#endif
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();

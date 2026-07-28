@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -18,10 +19,12 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <random>
 #include <filesystem>
 #include <utility>
 #include <fstream>
@@ -53,6 +56,21 @@ static uint32_t server_n_outputs_max(const common_params & params) {
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+static uint32_t server_resolve_moe_routing_seed(uint32_t seed) {
+    if (seed != LLAMA_DEFAULT_SEED) {
+        return seed;
+    }
+
+    static const bool is_rd_prng = std::random_device().entropy() == 0;
+    if (is_rd_prng) {
+        return (uint32_t) std::chrono::system_clock::now().time_since_epoch().count();
+    }
+
+    return std::random_device()();
+}
+#endif
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -323,6 +341,9 @@ struct server_slot {
         task.reset();
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        llama_clear_moe_routing_temperature(ctx_tgt, id);
+#endif
 
         // clear alora start
         alora_invocation_start = -1;
@@ -502,8 +523,8 @@ struct server_slot {
 
         timings.prompt_n            = n_prompt_tokens_processed;
         timings.prompt_ms           = t_prompt_processing;
-        timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
-        timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        timings.prompt_per_token_ms = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
+        timings.prompt_per_second   = t_prompt_processing > 0.0 ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
 
         timings.predicted_n            = n_decoded;
         timings.predicted_ms           = t_token_generation;
@@ -583,8 +604,8 @@ struct server_slot {
     }
 
     void print_timings() const {
-        const double t_prompt        =       t_prompt_processing / n_prompt_tokens_processed;
-        const double n_prompt_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        const double t_prompt        = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
+        const double n_prompt_second = t_prompt_processing > 0.0 ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
 
         const double t_gen        =       t_token_generation / n_decoded;
         const double n_gen_second = 1e3 / t_token_generation * n_decoded;
@@ -1005,10 +1026,22 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        if (params_base.exp_moe_routing_temperature) {
+#ifndef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            SRV_ERR("%s", "--exp-moe-routing-temperature requires compiling with -DLLAMA_EXP_MOE_ROUTING_TEMPERATURE=ON\n");
+            return false;
+#else
+            if (common_speculative_n_max(&params_base.speculative) > 0 || params_base.speculative.has_dft()) {
+                SRV_WRN("%s", "speculative decoding is disabled by --exp-moe-routing-temperature\n");
+            }
+            params_base.speculative = {};
+#endif
+        }
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
-        const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
+        const bool has_mmproj = !params_base.mmproj.path.empty();
+        const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
@@ -1156,6 +1189,13 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        if (params_base.exp_moe_routing_temperature && llama_model_n_expert(model_tgt) <= 0) {
+            SRV_ERR("%s", "--exp-moe-routing-temperature requires a model with routed experts\n");
+            return false;
+        }
+#endif
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -1757,6 +1797,13 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            uint32_t moe_routing_seed = LLAMA_DEFAULT_SEED;
+            if (params_base.exp_moe_routing_temperature) {
+                task.params.sampling.greedy_only = true;
+                moe_routing_seed = server_resolve_moe_routing_seed(task.params.sampling.seed);
+            }
+#endif
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
@@ -1764,6 +1811,20 @@ private:
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            if (params_base.exp_moe_routing_temperature) {
+                if (!llama_set_moe_routing_temperature(
+                            ctx_tgt, slot.id, task.params.sampling.temp, moe_routing_seed)) {
+                    slot.smpl.reset();
+                    send_error(
+                        task,
+                        "Failed to configure MoE routing temperature; temperature must be finite and non-negative",
+                        ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+            }
+#endif
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
@@ -1776,6 +1837,9 @@ private:
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_pre_sample_logits;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            backend_sampling &= !params_base.exp_moe_routing_temperature;
+#endif
 
             // TODO: tmp until backend sampling is fully implemented
             if (backend_sampling) {
@@ -1934,7 +1998,14 @@ private:
         return slot.has_next_token; // continue
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    void populate_token_probs(
+            const server_slot &       slot,
+            completion_token_output & result,
+            bool                      post_sampling,
+            bool                      special,
+            int                       idx,
+            const float *             retained_logits = nullptr,
+            size_t                    n_retained_logits = 0) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -1966,7 +2037,9 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = retained_logits
+                ? get_token_probabilities(retained_logits, n_retained_logits, n_probs_request)
+                : get_token_probabilities(ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -1990,6 +2063,61 @@ private:
             }
         }
     }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    bool sample_retained_prompt_logits(server_slot & slot) {
+        GGML_ASSERT(params_base.exp_moe_routing_temperature);
+        GGML_ASSERT(slot.task->need_sampling());
+        GGML_ASSERT(slot.prompt.logits_n_tokens == (size_t) slot.task->n_tokens());
+        GGML_ASSERT(slot.prompt.logits.size() == (size_t) llama_vocab_n_tokens(vocab));
+
+        slot.state = SLOT_STATE_GENERATING;
+
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample(
+                slot.smpl.get(),
+                slot.ctx_tgt,
+                slot.prompt.logits.data(),
+                slot.prompt.logits.size());
+        }
+
+        slot.i_batch = -1;
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        const int64_t t_now = ggml_time_us();
+        slot.n_decoded = 1;
+        slot.t_start_generation = t_now;
+        slot.t_print_last = t_now;
+        slot.n_decoded_last = 0;
+        slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+        slot.t_token_generation = 0.001;
+        metrics.on_prompt_eval(slot);
+
+        completion_token_output result;
+        result.tok = id;
+        const bool accept_special =
+            params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(result.tok) !=
+                slot.task->params.sampling.preserved_tokens.end();
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special);
+        result.prob = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(
+                slot,
+                result,
+                slot.task->params.post_sampling_probs,
+                params_base.special,
+                -1,
+                slot.prompt.logits.data(),
+                slot.prompt.logits.size());
+        }
+
+        return process_token(result, slot);
+    }
+#endif
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(task.id, error, type);
@@ -3339,17 +3467,38 @@ private:
                             }
                         }
 
+                        bool use_retained_prompt_logits = false;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+                        if (params_base.exp_moe_routing_temperature &&
+                            slot.task->need_sampling() &&
+                            n_past == slot.task->n_tokens() &&
+                            slot.prompt.logits_n_tokens == (size_t) n_past &&
+                            slot.prompt.logits.size() == (size_t) llama_vocab_n_tokens(vocab)) {
+                            use_retained_prompt_logits = true;
+                        }
+#endif
+
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            if (use_retained_prompt_logits) {
+                                SLT_INF(slot, "using retained prompt logits (n_past = %d)\n", n_past);
+                            } else {
+                                SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                                n_past--;
+                                SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            }
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+                        if (slot.prompt.logits_n_tokens != (size_t) n_past) {
+                            slot.prompt.logits_n_tokens = 0;
+                            slot.prompt.logits.clear();
+                        }
+#endif
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -3361,6 +3510,48 @@ private:
                                 send_partial_response(slot, {}, false, true);
                             }
                         }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+                        if (use_retained_prompt_logits) {
+                            slot.n_decoded = 0;
+                            slot.init_sampler();
+
+                            const llama_pos p0 = slot.prompt.tokens.pos_next();
+                            common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                            if (ctx_dft) {
+                                common_context_seq_rm(ctx_dft, slot.id, p0, -1);
+                            }
+
+                            std::vector<server_slot *> retained_slots = { &slot };
+                            if (slot.task->is_parent()) {
+                                slot.state = SLOT_STATE_DONE_PROMPT;
+                                for (auto & child : slots) {
+                                    if (child.state == SLOT_STATE_WAIT_OTHER &&
+                                        child.task->id_parent == slot.task->id) {
+                                        slot.copy_state_to(child);
+                                        child.state = SLOT_STATE_DONE_PROMPT;
+                                        retained_slots.push_back(&child);
+                                    }
+                                }
+                            }
+
+                            for (server_slot * retained_slot : retained_slots) {
+                                if (!sample_retained_prompt_logits(*retained_slot)) {
+                                    retained_slot->print_timings();
+                                    send_final_response(*retained_slot);
+                                    metrics.on_prediction(*retained_slot);
+                                    retained_slot->release();
+                                    continue;
+                                }
+
+                                if (!slot_batched) {
+                                    slot_batched = retained_slot;
+                                }
+                                retained_slot->handle_last_sampled_token(batch);
+                            }
+                            return;
+                        }
+#endif
                     } // end of SLOT_STATE_STARTED
 
                     if (!slot.can_split()) {
@@ -3713,7 +3904,8 @@ private:
                 return;
             }
 
-            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+            const bool prompt_just_finished = slot.state == SLOT_STATE_DONE_PROMPT;
+            if (prompt_just_finished) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
@@ -3747,6 +3939,16 @@ private:
 
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            if (prompt_just_finished && params_base.exp_moe_routing_temperature) {
+                const float * logits = llama_get_logits_ith(ctx_tgt, tok_idx);
+                const size_t n_vocab = llama_vocab_n_tokens(vocab);
+                GGML_ASSERT(logits != nullptr);
+                slot.prompt.logits_n_tokens = slot.task->n_tokens();
+                slot.prompt.logits.assign(logits, logits + n_vocab);
+            }
+#endif
 
             llama_token id;
             {
@@ -3850,6 +4052,10 @@ private:
                         }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+                        slot.prompt.logits_n_tokens = 0;
+                        slot.prompt.logits.clear();
+#endif
                         slot.smpl = std::move(smpl_save);
 
                         return;
@@ -3885,6 +4091,10 @@ private:
             // add accepted tokens to the prompt
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            slot.prompt.logits_n_tokens = 0;
+            slot.prompt.logits.clear();
+#endif
 
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);

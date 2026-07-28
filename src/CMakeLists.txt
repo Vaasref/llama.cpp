@@ -60,3 +60,7 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+if (LLAMA_EXP_MOE_ROUTING_TEMPERATURE)
+    target_compile_definitions(llama PUBLIC LLAMA_EXP_MOE_ROUTING_TEMPERATURE)
+endif()

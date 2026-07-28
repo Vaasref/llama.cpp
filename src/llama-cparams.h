@@ -54,6 +54,9 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool expert_output_capture;
     bool expert_output_capture_only;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    bool moe_routing_temperature;
+#endif
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

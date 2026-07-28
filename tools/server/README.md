@@ -188,6 +188,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--embd-normalize N` | normalisation for embeddings (default: 2) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm) |
 | `--host HOST` | ip address to listen, or bind to an UNIX socket if the address ends with .sock (default: 127.0.0.1)<br/>(env: LLAMA_ARG_HOST) |
 | `--port PORT` | port to listen (default: 8080)<br/>(env: LLAMA_ARG_PORT) |
+| `--exp-moe-routing-temperature` | (experimental) use request temperature and seed to perturb MoE routing logits; requires build with -DLLAMA_EXP_MOE_ROUTING_TEMPERATURE=ON (default: disabled)<br/>(env: LLAMA_ARG_EXP_MOE_ROUTING_TEMPERATURE) |
 | `--reuse-port` | allow multiple sockets to bind to the same port (default: disabled)<br/>(env: LLAMA_ARG_REUSE_PORT) |
 | `--path PATH` | path to serve static files from (default: )<br/>(env: LLAMA_ARG_STATIC_PATH) |
 | `--cors-origins ORIGINS` | comma-separated list of allowed origins for CORS (default: *)<br/>if set to special value 'localhost', reflect the Origin header only if it is localhost<br/>(env: LLAMA_ARG_CORS_ORIGINS) |
@@ -348,6 +349,24 @@ To use this feature, start the server with `--tools all`. You can also enable on
   ```
 
   Binary is at `./build/bin/llama-server`
+
+### Experimental seeded MoE routing temperature
+
+This experiment moves request pseudorandomness into learned MoE routing. It is disabled by default and requires both the compile option and the server flag:
+
+```bash
+cmake -B build -DLLAMA_EXP_MOE_ROUTING_TEMPERATURE=ON
+cmake --build build --config Release -t llama-server
+./build/bin/llama-server -m model.gguf --exp-moe-routing-temperature
+```
+
+`LLAMA_ARG_EXP_MOE_ROUTING_TEMPERATURE=1` is equivalent to the runtime flag. The server rejects the flag when support was not compiled in or when the loaded model has no routed experts. Speculative decoding is disabled while the experiment is active.
+
+For each completion, `temperature` and `seed` control MoE routing instead of token sampling. The resolved seed produces a fixed row-major `[n_layers, max_experts]` matrix with factors `1 + temperature * U(0,1)`. Non-uniform MoE layers use the prefix matching that layer's expert count. The factors multiply learned-router logits before gating and expert selection.
+
+Token selection is greedy after grammar and structured-output masks. Other token-sampling controls are ignored. Backend sampling is disabled so full prompt-boundary logits can be retained.
+
+Prompt and RAM-cache prefixes are not recomputed when `temperature` or `seed` changes, so reused prefixes retain their original routing decisions. Exact prompt matches use the retained next-token logits without evaluating another prompt token. Partial matches reevaluate their final prompt token.
 
 ## Build with SSL
 

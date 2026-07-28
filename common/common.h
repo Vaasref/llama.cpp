@@ -251,6 +251,9 @@ struct common_params_sampling {
     bool    ignore_eos         = false;
     bool    no_perf            = false;  // disable performance metrics
     bool    timing_per_token   = false;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    bool    greedy_only        = false;
+#endif
 
     uint64_t user_sampling_config = 0; // bitfield to track user-specified samplers
 
@@ -494,6 +497,7 @@ struct common_params {
     void *                           cb_eval_row_order_user_data = nullptr;
     bool                             expert_output_capture       = false;
     bool                             expert_output_capture_only  = false;
+    bool                             exp_moe_routing_temperature = false;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 

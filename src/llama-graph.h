@@ -90,6 +90,17 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+struct llama_moe_routing_temperature_config {
+    uint32_t n_layer;
+    uint32_t n_expert;
+    std::vector<float> factors;
+};
+
+using llama_moe_routing_temperature_configs =
+    std::map<llama_seq_id, llama_moe_routing_temperature_config>;
+#endif
+
 //
 // llm_graph_input
 //
@@ -181,6 +192,32 @@ public:
     const float    f_attn_temp_scale;
     const float    f_attn_temp_offset;
 };
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+class llm_graph_input_moe_routing_temperature : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_routing_temperature(
+            int64_t n_layer,
+            int64_t n_expert,
+            int64_t n_seq_max,
+            int64_t n_tokens,
+            const llama_moe_routing_temperature_configs * configs) :
+        n_layer(n_layer), n_expert(n_expert), n_seq_max(n_seq_max), n_tokens(n_tokens), configs(configs) {}
+    virtual ~llm_graph_input_moe_routing_temperature() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * factors = nullptr;
+    ggml_tensor * seq_ids = nullptr;
+
+    const int64_t n_layer;
+    const int64_t n_expert;
+    const int64_t n_seq_max;
+    const int64_t n_tokens;
+    const llama_moe_routing_temperature_configs * configs;
+};
+#endif
 
 class llm_graph_input_pos_bucket : public llm_graph_input_i {
 public:
@@ -688,6 +725,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    const llama_moe_routing_temperature_configs * moe_routing_temperature;
+#endif
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -779,6 +820,9 @@ struct llm_graph_params {
             cparams.expert_output_capture   == other.cparams.expert_output_capture   &&
             cparams.expert_output_capture_only == other.cparams.expert_output_capture_only &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            cparams.moe_routing_temperature == other.cparams.moe_routing_temperature &&
+#endif
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -841,6 +885,10 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
     ggml_tensor * t_inp_out_ids = nullptr;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    ggml_tensor * t_inp_moe_routing_temperature = nullptr;
+    ggml_tensor * t_inp_moe_routing_seq_ids     = nullptr;
+#endif
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -931,6 +979,10 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    const llama_moe_routing_temperature_configs * moe_routing_temperature;
+#endif
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1056,6 +1108,9 @@ struct llm_graph_context {
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    ggml_tensor * build_inp_moe_routing_temperature(int il, const ggml_tensor * logits) const;
+#endif
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;

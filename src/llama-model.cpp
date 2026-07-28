@@ -1089,7 +1089,17 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
-    ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
+
+    std::fill(hparams.n_expert_arr.begin(), hparams.n_expert_arr.end(), 0);
+    if (arch == LLM_ARCH_MISTRAL4) {
+        if (ml.get_key_or_arr(LLM_KV_EXPERT_COUNT, hparams.n_expert_arr, hparams.n_layer_all, false)) {
+            hparams.n_expert = *std::max_element(
+                hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all);
+        }
+    } else {
+        ml.get_key(LLM_KV_EXPERT_COUNT, hparams.n_expert, false);
+        std::fill_n(hparams.n_expert_arr.begin(), hparams.n_layer_all, hparams.n_expert);
+    }
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
@@ -1098,6 +1108,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         if (hparams.n_expert <= 1) {
             hparams.n_expert      = 0;
             hparams.n_expert_used = 0;
+            std::fill_n(hparams.n_expert_arr.begin(), hparams.n_layer_all, 0);
         }
     }
 
@@ -1113,14 +1124,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
-    GGML_ASSERT(hparams.n_expert_used <= hparams.n_expert);
     if (hparams.n_expert > 0) {
         GGML_ASSERT(hparams.n_expert_used > 0);
-        GGML_ASSERT(hparams.n_expert_groups < hparams.n_expert);
-        if (hparams.n_expert_groups > 1) {
-            GGML_ASSERT(hparams.n_expert % hparams.n_expert_groups == 0);
-            GGML_ASSERT(hparams.n_group_used > 0);
-            GGML_ASSERT(hparams.n_group_used < hparams.n_expert_groups);
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            const uint32_t n_expert = hparams.n_expert_for_layer(il);
+            GGML_ASSERT(n_expert > 0);
+            GGML_ASSERT(n_expert <= LLAMA_MAX_EXPERTS);
+            GGML_ASSERT(hparams.n_expert_used <= n_expert);
+            GGML_ASSERT(hparams.n_expert_groups < n_expert);
+            if (hparams.n_expert_groups > 1) {
+                GGML_ASSERT(n_expert % hparams.n_expert_groups == 0);
+                GGML_ASSERT(hparams.n_group_used > 0);
+                GGML_ASSERT(hparams.n_group_used < hparams.n_expert_groups);
+            }
         }
     } else {
         GGML_ASSERT(hparams.n_expert_used == 0);
@@ -1345,10 +1361,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // TODO: move to a separate function
         const auto tn = LLM_TN(arch);
 
-        const int64_t n_expert      = hparams.n_expert;
         const int64_t n_expert_used = hparams.n_expert_used;
 
-        if (n_expert > 0 && n_expert_used == 0) {
+        if (hparams.n_expert > 0 && n_expert_used == 0) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
         }
 
@@ -1361,6 +1376,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
             auto & layer = layers[i];
+            const int64_t n_expert = hparams.n_expert_for_layer(i);
 
             // attention weight scales (per-tensor, shape {1})
             if (!layer.wq_s && layer.wq) {
@@ -1796,7 +1812,7 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: f_attn_scale          = %.1e\n",   __func__, hparams.f_attention_scale);
         LLAMA_LOG_INFO("%s: f_attn_value_scale    = %.4f\n",   __func__, hparams.f_attn_value_scale);
         LLAMA_LOG_INFO("%s: n_ff                  = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_ff(il); }, hparams.n_layer_all).c_str());
-        LLAMA_LOG_INFO("%s: n_expert              = %u\n",     __func__, hparams.n_expert);
+        LLAMA_LOG_INFO("%s: n_expert              = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_expert_for_layer(il); }, hparams.n_layer_all).c_str());
         LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used);
         LLAMA_LOG_INFO("%s: n_expert_groups       = %d\n",     __func__, hparams.n_expert_groups);
         LLAMA_LOG_INFO("%s: n_group_used          = %d\n",     __func__, hparams.n_group_used);

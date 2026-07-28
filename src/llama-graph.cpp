@@ -170,6 +170,56 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+void llm_graph_input_moe_routing_temperature::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(factors != nullptr);
+    GGML_ASSERT(seq_ids != nullptr);
+    GGML_ASSERT(configs != nullptr);
+    GGML_ASSERT(ubatch->n_tokens == n_tokens);
+
+    const size_t matrix_size = (size_t) n_layer * n_expert;
+    std::vector<float> factor_data(matrix_size * n_seq_max, 1.0f);
+    std::vector<int32_t> seq_id_data(n_tokens);
+
+    for (int64_t it = 0; it < n_tokens; ++it) {
+        GGML_ASSERT(ubatch->n_seq_id[it] == 1);
+        const llama_seq_id seq_id = ubatch->seq_id[it][0];
+        GGML_ASSERT(seq_id >= 0 && seq_id < n_seq_max);
+        seq_id_data[it] = seq_id;
+    }
+
+    for (const auto & entry : *configs) {
+        const llama_seq_id seq_id = entry.first;
+        if (seq_id < 0 || seq_id >= n_seq_max) {
+            continue;
+        }
+
+        const auto & config = entry.second;
+        GGML_ASSERT(config.n_layer == (uint32_t) n_layer);
+        GGML_ASSERT(config.n_expert == (uint32_t) n_expert);
+        GGML_ASSERT(config.factors.size() == matrix_size);
+        std::memcpy(factor_data.data() + (size_t) seq_id * matrix_size,
+                    config.factors.data(), matrix_size * sizeof(float));
+    }
+
+    ggml_backend_tensor_set(factors, factor_data.data(), 0, factor_data.size() * sizeof(float));
+    ggml_backend_tensor_set(seq_ids, seq_id_data.data(), 0, seq_id_data.size() * sizeof(int32_t));
+}
+
+bool llm_graph_input_moe_routing_temperature::can_reuse(const llm_graph_params & params) {
+    return params.cparams.moe_routing_temperature &&
+        params.moe_routing_temperature == configs &&
+        factors != nullptr &&
+        seq_ids != nullptr &&
+        factors->ne[0] == n_expert &&
+        factors->ne[1] == n_layer &&
+        factors->ne[2] == n_seq_max &&
+        seq_ids->ne[0] == n_tokens &&
+        params.cparams.n_seq_max == (uint32_t) n_seq_max &&
+        params.ubatch.n_tokens == n_tokens;
+}
+#endif
+
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
     if (pos_bucket) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1195,6 +1245,10 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
     t_inp_out_ids = nullptr;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    t_inp_moe_routing_temperature = nullptr;
+    t_inp_moe_routing_seq_ids     = nullptr;
+#endif
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1362,6 +1416,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    moe_routing_temperature(params.moe_routing_temperature),
+#endif
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1858,6 +1915,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(logits, "ffn_moe_logits_biased", il);
     }
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    if (cparams.moe_routing_temperature) {
+        ggml_tensor * factors = build_inp_moe_routing_temperature(il, logits);
+        logits = ggml_mul(ctx0, logits, factors);
+        cb(logits, "ffn_moe_logits_routing_temperature", il);
+    }
+#endif
+
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
@@ -2301,6 +2366,55 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
 
     return cur;
 }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+ggml_tensor * llm_graph_context::build_inp_moe_routing_temperature(
+        int il, const ggml_tensor * logits) const {
+    GGML_ASSERT(moe_routing_temperature != nullptr);
+    GGML_ASSERT(logits != nullptr);
+    GGML_ASSERT(il >= 0 && (uint32_t) il < hparams.n_layer_all);
+    const int64_t n_expert = logits->ne[0];
+    GGML_ASSERT(n_expert > 0 && n_expert <= hparams.n_expert);
+    const int64_t n_router_tokens = ggml_nelements(logits) / n_expert;
+    GGML_ASSERT(n_router_tokens == n_tokens || n_router_tokens == n_outputs);
+
+    if (res->t_inp_moe_routing_temperature == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_moe_routing_temperature>(
+            hparams.n_layer_all, hparams.n_expert, cparams.n_seq_max, n_tokens, moe_routing_temperature);
+
+        inp->factors = ggml_new_tensor_3d(
+            ctx0, GGML_TYPE_F32, hparams.n_expert, hparams.n_layer_all, cparams.n_seq_max);
+        ggml_set_input(inp->factors);
+        ggml_set_name(inp->factors, "moe_routing_temperature");
+
+        inp->seq_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->seq_ids);
+        ggml_set_name(inp->seq_ids, "moe_routing_seq_ids");
+
+        res->t_inp_moe_routing_temperature = inp->factors;
+        res->t_inp_moe_routing_seq_ids     = inp->seq_ids;
+        res->add_input(std::move(inp));
+    }
+
+    GGML_ASSERT(res->t_inp_moe_routing_seq_ids != nullptr);
+    ggml_tensor * factor_rows = ggml_view_2d(
+        ctx0,
+        res->t_inp_moe_routing_temperature,
+        n_expert,
+        cparams.n_seq_max,
+        res->t_inp_moe_routing_temperature->nb[2],
+        (size_t) il * res->t_inp_moe_routing_temperature->nb[1]);
+    ggml_tensor * factors = ggml_get_rows(ctx0, factor_rows, res->t_inp_moe_routing_seq_ids);
+
+    if (n_router_tokens < n_tokens) {
+        GGML_ASSERT(res->t_inp_out_ids != nullptr);
+        factors = ggml_get_rows(ctx0, factors, res->t_inp_out_ids);
+    }
+
+    ggml_format_name(factors, "moe_routing_temperature_l%d", il);
+    return factors;
+}
+#endif
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,

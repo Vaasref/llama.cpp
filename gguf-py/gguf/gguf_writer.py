@@ -836,8 +836,11 @@ class GGUFWriter:
     def add_final_logit_softcapping(self, value: float) -> None:
         self.add_float32(Keys.LLM.FINAL_LOGIT_SOFTCAPPING.format(arch=self.arch), value)
 
-    def add_expert_count(self, count: int) -> None:
-        self.add_uint32(Keys.LLM.EXPERT_COUNT.format(arch=self.arch), count)
+    def add_expert_count(self, count: int | Sequence[int]) -> None:
+        if isinstance(count, int):
+            self.add_uint32(Keys.LLM.EXPERT_COUNT.format(arch=self.arch), count)
+        else:
+            self.add_array(Keys.LLM.EXPERT_COUNT.format(arch=self.arch), count)
 
     def add_expert_used_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_USED_COUNT.format(arch=self.arch), count)

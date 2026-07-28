@@ -24,6 +24,11 @@ class llama_io_write_i;
 struct llama_memory_i;
 struct llama_memory_context_i;
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+llama_moe_routing_temperature_config llama_moe_routing_temperature_config_init(
+        uint32_t n_layer, uint32_t n_expert, float temperature, uint32_t seed);
+#endif
+
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
     int n_tensors = 0;
@@ -253,6 +258,11 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    bool set_moe_routing_temperature(llama_seq_id seq_id, float temperature, uint32_t seed);
+    void clear_moe_routing_temperature(llama_seq_id seq_id);
+#endif
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -287,6 +297,10 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    llama_moe_routing_temperature_configs moe_routing_temperature;
+#endif
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

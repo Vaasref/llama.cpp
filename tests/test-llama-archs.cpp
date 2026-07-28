@@ -1,5 +1,6 @@
 #include "common.h"
 #include "log.h"
+#include "sampling.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -7,8 +8,9 @@
 #include "llama.h"
 #include "llama-cpp.h"
 
-// TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-context.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -79,7 +82,13 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(
+        const llm_arch arch,
+        const bool moe,
+        const bool non_uniform_mistral4 = false,
+        const uint32_t n_layer_override = 0,
+        const bool invalid_expert_array = false) {
+    GGML_ASSERT(!(non_uniform_mistral4 || invalid_expert_array) || (arch == LLM_ARCH_MISTRAL4 && moe));
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -114,6 +123,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     } else if (arch == LLM_ARCH_CHAMELEON) {
         n_vocab = 10240;
     }
+    if (n_layer_override > 0) {
+        n_layer = n_layer_override;
+    }
 
     const uint32_t n_embd_head = n_embd / n_head;
 
@@ -123,7 +135,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
-    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(non_uniform_mistral4 ? 0 : 1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -216,7 +228,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     if (moe) {
         ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
+        if (non_uniform_mistral4) {
+            std::vector<uint32_t> n_expert_per_layer;
+            n_expert_per_layer.reserve(n_layer);
+            const uint32_t n_expert_layers = invalid_expert_array ? n_layer - 1 : n_layer;
+            for (uint32_t il = 0; il < n_expert_layers; ++il) {
+                n_expert_per_layer.push_back(2 + il % 2);
+            }
+            ms.add_kv(LLM_KV_EXPERT_COUNT, n_expert_per_layer);
+        } else {
+            ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(2));
+        }
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
@@ -263,7 +285,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, uint32_t n_seq_max = 1) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -276,9 +298,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.n_seq_max = n_seq_max;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    ctx_params.moe_routing_temperature = true;
+#endif
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -326,6 +352,180 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+static bool test_moe_routing_temperature_matrix() {
+    constexpr uint32_t n_layer = 2;
+    constexpr uint32_t n_expert = 3;
+    constexpr uint32_t seed = 0x12345678;
+    constexpr float temperature = 0.75f;
+
+    const auto config = llama_moe_routing_temperature_config_init(
+        n_layer, n_expert, temperature, seed);
+    const auto config_same = llama_moe_routing_temperature_config_init(
+        n_layer, n_expert, temperature, seed);
+    const auto identity = llama_moe_routing_temperature_config_init(
+        n_layer, n_expert, 0.0f, seed);
+
+    if (config.n_layer != n_layer ||
+            config.n_expert != n_expert ||
+            config.factors.size() != (size_t) n_layer * n_expert ||
+            config.factors != config_same.factors) {
+        return false;
+    }
+
+    std::mt19937 rng(seed);
+    const double scale = 1.0 / ((double) std::mt19937::max() + 1.0);
+    for (size_t i = 0; i < config.factors.size(); ++i) {
+        const float uniform = (float) ((double) rng() * scale);
+        const float expected = 1.0f + temperature * uniform;
+        if (config.factors[i] != expected ||
+                config.factors[i] < 1.0f ||
+                config.factors[i] >= 1.0f + temperature ||
+                identity.factors[i] != 1.0f) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool test_moe_routing_temperature_many_layers(const size_t seed) {
+    constexpr uint32_t n_layer = 32;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MISTRAL4, true, true, n_layer);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+
+    if (!llama_set_moe_routing_temperature(model_and_ctx.second.get(), 0, 0.75f, 1234)) {
+        return false;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(2, 128, seed);
+    return !get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens).empty();
+}
+
+static bool test_moe_routing_temperature_logits(const size_t seed) {
+    const std::vector<llama_token> tokens = get_tokens(8, 128, seed);
+    const auto run = [&](float temperature, uint32_t routing_seed) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MISTRAL4, true, true);
+        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+        if (!llama_set_moe_routing_temperature(
+                    model_and_ctx.second.get(), 0, temperature, routing_seed)) {
+            throw std::runtime_error("failed to set MoE routing temperature");
+        }
+        return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    };
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MISTRAL4, true, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    if (llama_set_moe_routing_temperature(
+                model_and_ctx.second.get(), 0, -1.0f, 0) ||
+            llama_set_moe_routing_temperature(
+                model_and_ctx.second.get(), 0, std::numeric_limits<float>::infinity(), 0)) {
+        return false;
+    }
+
+    const auto identity = run(0.0f, 1234);
+    const auto routed_a = run(0.75f, 1234);
+    const auto routed_b = run(0.75f, 1234);
+    const auto routed_c = run(0.75f, 5678);
+    return routed_a == routed_b && routed_a != identity && routed_a != routed_c;
+}
+
+static bool test_moe_routing_temperature_rejects_shared_tokens(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MISTRAL4, true, true);
+    auto model_and_ctx = get_model_and_ctx(
+        gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2);
+
+    llama_batch batch = llama_batch_init(1, 0, 2);
+    common_batch_add(batch, 0, 0, {0, 1}, true);
+    const int result = llama_decode(model_and_ctx.second.get(), batch);
+    llama_batch_free(batch);
+    return result == -1;
+}
+#endif
+
+static bool test_mistral4_non_uniform(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MISTRAL4, true, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+
+    if (llama_model_n_expert(model_and_ctx.first.get()) != 3) {
+        return false;
+    }
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    common_params_sampling sampling;
+    sampling.greedy_only = true;
+    sampling.mirostat = 2;
+    sampling.logit_bias.push_back({0, 100.0f});
+    common_sampler_ptr sampler(common_sampler_init(model_and_ctx.first.get(), sampling));
+    if (common_sampler_print(sampler.get()) != "logits -> greedy ") {
+        return false;
+    }
+#endif
+
+    const std::vector<llama_token> tokens = get_tokens(16, 128, seed);
+    model_and_ctx.second->set_warmup(true);
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    model_and_ctx.second->set_warmup(false);
+    llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
+    const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
+    if (!llama_set_moe_routing_temperature(model_and_ctx.second.get(), 0, 0.0f, 1234)) {
+        return false;
+    }
+    const std::vector<float> logits_identity =
+        get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    if (logits_identity != logits) {
+        return false;
+    }
+
+    llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
+    if (!llama_set_moe_routing_temperature(model_and_ctx.second.get(), 0, 0.75f, 1234)) {
+        return false;
+    }
+    const std::vector<float> logits_seeded =
+        get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+
+    llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
+    if (!llama_set_moe_routing_temperature(model_and_ctx.second.get(), 0, 0.75f, 1234)) {
+        return false;
+    }
+    const std::vector<float> logits_seeded_again =
+        get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    if (logits_seeded == logits || logits_seeded_again != logits_seeded) {
+        return false;
+    }
+    llama_clear_moe_routing_temperature(model_and_ctx.second.get(), 0);
+#endif
+
+    FILE * file = tmpfile();
+    if (file == nullptr) {
+        return true;
+    }
+
+    llama_model_saver ms(model_and_ctx.first.get());
+    ms.add_kv_from_model();
+    ms.add_tensors_from_model();
+    ms.save(file);
+    rewind(file);
+
+    auto roundtrip = get_model_and_ctx(nullptr, file, seed, {});
+    const std::vector<float> logits_roundtrip = get_logits(roundtrip.first.get(), roundtrip.second.get(), tokens);
+    return logits_roundtrip == logits;
+}
+
+static bool test_mistral4_invalid_expert_array(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MISTRAL4, true, true, 0, true);
+    try {
+        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+        GGML_UNUSED(model_and_ctx);
+    } catch (const std::exception &) {
+        return true;
+    }
+    return false;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -706,6 +906,36 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+        if (!test_moe_routing_temperature_matrix()) {
+            fprintf(stderr, "MoE routing temperature matrix test failed\n");
+            return 1;
+        }
+        if ((arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_MISTRAL4) &&
+                !test_moe_routing_temperature_many_layers(seed)) {
+            fprintf(stderr, "MoE routing temperature many-layer test failed\n");
+            return 1;
+        }
+        if ((arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_MISTRAL4) &&
+                !test_moe_routing_temperature_logits(seed)) {
+            fprintf(stderr, "MoE routing temperature logits test failed\n");
+            return 1;
+        }
+        if ((arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_MISTRAL4) &&
+                !test_moe_routing_temperature_rejects_shared_tokens(seed)) {
+            fprintf(stderr, "MoE routing temperature shared-token test failed\n");
+            return 1;
+        }
+#endif
+        if ((arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_MISTRAL4) && !test_mistral4_non_uniform(seed)) {
+            fprintf(stderr, "Mistral4 non-uniform expert test failed\n");
+            return 1;
+        }
+        if ((arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_MISTRAL4) &&
+                !test_mistral4_invalid_expert_array(seed)) {
+            fprintf(stderr, "Mistral4 invalid expert array test failed\n");
+            return 1;
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

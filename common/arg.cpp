@@ -3193,6 +3193,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_HOST"));
     add_opt(common_arg(
+        {"--exp-moe-routing-temperature"},
+        string_format("(experimental) use request temperature and seed to perturb MoE routing logits; "
+                      "requires build with -DLLAMA_EXP_MOE_ROUTING_TEMPERATURE=ON (default: %s)",
+                      params.exp_moe_routing_temperature ? "enabled" : "disabled"),
+        [](common_params & params) {
+#ifndef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            fprintf(stderr, "warning: MoE routing temperature is not compiled in; build with -DLLAMA_EXP_MOE_ROUTING_TEMPERATURE=ON\n");
+#endif
+            params.exp_moe_routing_temperature = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXP_MOE_ROUTING_TEMPERATURE"));
+    add_opt(common_arg(
         {"--port"}, "PORT",
         string_format("port to listen (default: %d)", params.port),
         [](common_params & params, int value) {

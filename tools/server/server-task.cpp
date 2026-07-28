@@ -1662,6 +1662,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            if (it->prompt.logits_n_tokens != prompt.logits_n_tokens ||
+                it->prompt.logits.size() != prompt.logits.size()) {
+                continue;
+            }
+#endif
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1673,7 +1679,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+    state_size_new += prompt.logits.size() * sizeof(float);
+#endif
 
     // skip over-limit entries to avoid disturbing the cache
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -1728,6 +1737,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+#ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
+            /*.logits_n_tokens =*/ prompt.logits_n_tokens,
+            /*.logits          =*/ prompt.logits,
+#endif
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
