@@ -488,8 +488,12 @@ struct common_params {
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
-    ggml_backend_sched_eval_callback cb_eval = nullptr;
-    void * cb_eval_user_data                 = nullptr;
+    ggml_backend_sched_eval_callback cb_eval                    = nullptr;
+    void *                           cb_eval_user_data          = nullptr;
+    llama_eval_row_order_callback    cb_eval_row_order          = nullptr;
+    void *                           cb_eval_row_order_user_data = nullptr;
+    bool                             expert_output_capture       = false;
+    bool                             expert_output_capture_only  = false;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 

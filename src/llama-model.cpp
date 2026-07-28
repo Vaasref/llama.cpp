@@ -2299,6 +2299,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
+    if (params.cparams.expert_output_capture_only) {
+        GGML_ASSERT(llm->res->t_embd != nullptr);
+        GGML_ASSERT(llm->res->trim_after(llm->res->t_embd));
+        llm->res->t_logits = nullptr;
+        llm->res->set_outputs(params);
+        return llm->res->get_gf();
+    }
+
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 

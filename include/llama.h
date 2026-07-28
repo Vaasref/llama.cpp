@@ -344,6 +344,10 @@ extern "C" {
         struct llama_sampler * sampler;
     };
 
+    // Reports submitted batch indices in internal evaluation order for rows marked as outputs.
+    // May be called multiple times per decode, once before each internal evaluation chunk.
+    typedef void (*llama_eval_row_order_callback)(const int32_t * row_ids, size_t n_rows, void * user_data);
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -374,6 +378,8 @@ extern "C" {
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
+        llama_eval_row_order_callback cb_eval_row_order;
+        void * cb_eval_row_order_user_data;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
@@ -395,6 +401,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool expert_output_capture;      // [EXPERIMENTAL] expose reduced MoE expert outputs to cb_eval
+        bool expert_output_capture_only; // [EXPERIMENTAL] capture all rows and omit logits
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

@@ -1194,6 +1194,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_inp_out_ids = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1269,6 +1270,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
+}
+
+bool llm_graph_result::trim_after(ggml_tensor * tensor) {
+    return ggml_graph_trim_after(gf, tensor);
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1971,11 +1976,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    auto capture_norm2 = [&](ggml_tensor * unweighted) {
+        if (!cparams.expert_output_capture) {
+            return;
+        }
+        cb(unweighted, "ffn_moe_expert_output", il);
+        ggml_tensor * norm2 = ggml_sum_rows(ctx0, ggml_sqr(ctx0, unweighted));
+        ggml_tensor * ids = ggml_reshape_3d(
+            ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), 1, n_expert_used, n_tokens);
+        ggml_tensor * capture = ggml_concat(ctx0, ggml_concat(ctx0, norm2, weights, 0), ids, 0);
+        if (n_outputs < n_tokens) {
+            GGML_ASSERT(res->t_inp_out_ids != nullptr);
+            capture = ggml_reshape_2d(ctx0, capture, 3 * n_expert_used, n_tokens);
+            capture = ggml_get_rows(ctx0, capture, res->t_inp_out_ids);
+            capture = ggml_reshape_3d(ctx0, capture, 3, n_expert_used, n_outputs);
+        }
+        cb(capture, "ffn_moe_expert_capture", il);
+        ggml_build_forward_expand(gf, capture);
+    };
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+        capture_norm2(repeated);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
     }
@@ -2119,6 +2144,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
+        capture_norm2(experts);
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
@@ -2291,6 +2317,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
+    res->t_inp_out_ids = cur;
 
     res->add_input(std::move(inp));
 

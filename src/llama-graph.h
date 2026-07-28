@@ -776,6 +776,8 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.expert_output_capture   == other.cparams.expert_output_capture   &&
+            cparams.expert_output_capture_only == other.cparams.expert_output_capture_only &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -814,6 +816,7 @@ public:
 
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
+    bool trim_after(ggml_tensor * tensor);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
@@ -837,6 +840,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_inp_out_ids = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

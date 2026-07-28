@@ -136,6 +136,10 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.cb_eval_row_order           = params.cb_eval_row_order;
+    cparams.cb_eval_row_order_user_data = params.cb_eval_row_order_user_data;
+    cparams.expert_output_capture       = params.expert_output_capture;
+    cparams.expert_output_capture_only  = params.expert_output_capture_only;
 
     cparams.ctx_other = nullptr;
 
@@ -1712,7 +1716,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_embd  = hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    const bool output_all   = cparams.embeddings || cparams.expert_output_capture_only;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -1849,6 +1853,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+        }
+
+        if (cparams.cb_eval_row_order && n_outputs > 0) {
+            const std::vector<int32_t> & row_ids = balloc->get_out_ids();
+            GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) row_ids.size());
+            cparams.cb_eval_row_order(
+                row_ids.data() + n_outputs_prev, n_outputs, cparams.cb_eval_row_order_user_data);
         }
 
         ggml_status status;
@@ -2083,7 +2094,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = !cparams.expert_output_capture_only;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -2157,7 +2168,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
-        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
+        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(new_size, 1)));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
@@ -3489,6 +3500,8 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.cb_eval_row_order           =*/ nullptr,
+        /*.cb_eval_row_order_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
@@ -3499,6 +3512,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.expert_output_capture       =*/ false,
+        /*.expert_output_capture_only  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -7529,6 +7529,16 @@ int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
     return cgraph->n_nodes;
 }
 
+bool ggml_graph_trim_after(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
+    for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
+        if (cgraph->nodes[i] == tensor) {
+            cgraph->n_nodes = i + 1;
+            return true;
+        }
+    }
+    return false;
+}
+
 void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
     GGML_ASSERT(cgraph->size > cgraph->n_nodes);
     cgraph->nodes[cgraph->n_nodes] = tensor;

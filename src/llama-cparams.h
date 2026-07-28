@@ -52,6 +52,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool expert_output_capture;
+    bool expert_output_capture_only;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
@@ -60,6 +62,8 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+    llama_eval_row_order_callback cb_eval_row_order;
+    void * cb_eval_row_order_user_data;
 
     llama_context * ctx_other;
 };
