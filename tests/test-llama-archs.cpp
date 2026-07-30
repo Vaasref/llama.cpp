@@ -83,13 +83,28 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
+static bool supports_non_uniform_experts(const llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_GRANITE_HYBRID:
+        case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_MINIMAX_M2:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static gguf_context_ptr get_gguf_ctx(
         const llm_arch arch,
         const bool moe,
-        const bool non_uniform_mistral4 = false,
+        const bool non_uniform_experts = false,
         const uint32_t n_layer_override = 0,
-        const bool invalid_expert_array = false) {
-    GGML_ASSERT(!(non_uniform_mistral4 || invalid_expert_array) || (arch == LLM_ARCH_MISTRAL4 && moe));
+        const bool invalid_expert_array = false,
+        const bool qwen_mtp = false) {
+    GGML_ASSERT(!(non_uniform_experts || invalid_expert_array) || (supports_non_uniform_experts(arch) && moe));
+    GGML_ASSERT(!qwen_mtp || arch == LLM_ARCH_QWEN35MOE);
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -136,7 +151,10 @@ static gguf_context_ptr get_gguf_ctx(
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
-    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(non_uniform_mistral4 ? 0 : 1));
+    if (qwen_mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
+    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(arch == LLM_ARCH_MISTRAL4 && non_uniform_experts ? 0 : 1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -229,7 +247,7 @@ static gguf_context_ptr get_gguf_ctx(
     if (moe) {
         ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
-        if (non_uniform_mistral4) {
+        if (non_uniform_experts) {
             std::vector<uint32_t> n_expert_per_layer;
             n_expert_per_layer.reserve(n_layer);
             const uint32_t n_expert_layers = invalid_expert_array ? n_layer - 1 : n_layer;
@@ -685,6 +703,78 @@ static bool test_mistral4_invalid_expert_array(const size_t seed) {
     return false;
 }
 
+static bool check_non_uniform_expert_tensors(const llama_model * model) {
+    if (llama_model_n_expert(model) != 3 || model->layers.size() != model->hparams.n_layer_all) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+        const int64_t n_expert = 2 + il % 2;
+        const llama_layer & layer = model->layers[il];
+        const ggml_tensor * expert_in = layer.ffn_gate_up_exps ? layer.ffn_gate_up_exps : layer.ffn_gate_exps;
+        if (model->hparams.n_expert_for_layer(il) != (uint32_t) n_expert ||
+                layer.ffn_gate_inp == nullptr ||
+                layer.ffn_gate_inp->ne[1] != n_expert ||
+                expert_in == nullptr ||
+                expert_in->ne[2] != n_expert ||
+                layer.ffn_down_exps == nullptr ||
+                layer.ffn_down_exps->ne[2] != n_expert) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool test_non_uniform_expert_arch(const llm_arch arch, const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    if (!check_non_uniform_expert_tensors(model_and_ctx.first.get())) {
+        return false;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(4, 128, seed);
+    model_and_ctx.second->set_warmup(true);
+    if (get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens).empty()) {
+        return false;
+    }
+    model_and_ctx.second->set_warmup(false);
+    if (run_capture_only(arch, true, false, seed, true).values.empty()) {
+        return false;
+    }
+
+    llama_model * model_to_save = model_and_ctx.first.get();
+    llama_model_ptr mtp_model;
+    if (arch == LLM_ARCH_QWEN35MOE) {
+        gguf_context_ptr mtp_gguf_ctx = get_gguf_ctx(arch, true, true, 0, false, true);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        size_t tensor_seed = seed;
+        mtp_model.reset(llama_model_init_from_user(
+            mtp_gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+        if (!mtp_model || !check_non_uniform_expert_tensors(mtp_model.get())) {
+            return false;
+        }
+        model_to_save = mtp_model.get();
+    }
+
+    FILE * file = tmpfile();
+    if (file == nullptr) {
+        return true;
+    }
+
+    llama_model_saver saver(model_to_save);
+    saver.add_kv_from_model();
+    saver.add_tensors_from_model();
+    saver.save(file);
+    rewind(file);
+
+    llama_model_params params = llama_model_default_params();
+    llama_model_ptr roundtrip(llama_model_load_from_file_ptr(file, params));
+    fclose(file);
+    return roundtrip && check_non_uniform_expert_tensors(roundtrip.get());
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1097,6 +1187,18 @@ int main(int argc, char ** argv) {
                 !test_mistral4_invalid_expert_array(seed)) {
             fprintf(stderr, "Mistral4 invalid expert array test failed\n");
             return 1;
+        }
+        for (const llm_arch non_uniform_arch : {
+                LLM_ARCH_QWEN35MOE,
+                LLM_ARCH_GRANITE_HYBRID,
+                LLM_ARCH_GEMMA4,
+                LLM_ARCH_MINIMAX_M2,
+            }) {
+            if ((arch == LLM_ARCH_UNKNOWN || arch == non_uniform_arch) &&
+                    !test_non_uniform_expert_arch(non_uniform_arch, seed)) {
+                fprintf(stderr, "%s non-uniform expert test failed\n", llm_arch_name(non_uniform_arch));
+                return 1;
+            }
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

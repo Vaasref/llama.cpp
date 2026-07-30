@@ -1091,14 +1091,21 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
 
     std::fill(hparams.n_expert_arr.begin(), hparams.n_expert_arr.end(), 0);
-    if (arch == LLM_ARCH_MISTRAL4) {
-        if (ml.get_key_or_arr(LLM_KV_EXPERT_COUNT, hparams.n_expert_arr, hparams.n_layer_all, false)) {
-            hparams.n_expert = *std::max_element(
-                hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all);
-        }
-    } else {
-        ml.get_key(LLM_KV_EXPERT_COUNT, hparams.n_expert, false);
-        std::fill_n(hparams.n_expert_arr.begin(), hparams.n_layer_all, hparams.n_expert);
+    switch (arch) {
+        case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_GRANITE_HYBRID:
+        case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_MINIMAX_M2:
+            if (ml.get_key_or_arr(LLM_KV_EXPERT_COUNT, hparams.n_expert_arr, hparams.n_layer_all, false)) {
+                hparams.n_expert = *std::max_element(
+                    hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all);
+            }
+            break;
+        default:
+            ml.get_key(LLM_KV_EXPERT_COUNT, hparams.n_expert, false);
+            std::fill_n(hparams.n_expert_arr.begin(), hparams.n_layer_all, hparams.n_expert);
+            break;
     }
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);

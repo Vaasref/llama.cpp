@@ -9,9 +9,11 @@
 #include "llama-model.h"
 #include "llama-vocab.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
@@ -226,7 +228,16 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,                hparams.swiglu_clamp_shexp);
     add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,             hparams.use_par_res);
     // add_kv(LLM_KV_TENSOR_DATA_LAYOUT,                ???);
-    add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert_arr, true);
+    if (std::all_of(
+            hparams.n_expert_arr.begin() + 1,
+            hparams.n_expert_arr.begin() + hparams.n_layer_all,
+            [&](uint32_t value) { return value == hparams.n_expert_arr[0]; })) {
+        add_kv(LLM_KV_EXPERT_COUNT, hparams.n_expert_arr[0]);
+    } else {
+        const std::vector<uint32_t> n_expert_arr(
+            hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all);
+        add_kv(LLM_KV_EXPERT_COUNT, n_expert_arr, false);
+    }
     add_kv(LLM_KV_EXPERT_USED_COUNT,                 hparams.n_expert_used);
     add_kv(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
     add_kv(LLM_KV_EXPERT_GROUP_COUNT,                hparams.n_expert_groups);
@@ -276,7 +287,13 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_GATE_LORA_RANK,          hparams.n_lora_gate);
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
-    // add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,  ???);
+    if (model->arch == LLM_ARCH_GEMMA4 || model->arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, true);
+        add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+        if (hparams.n_layer_kv_from_start >= 0 && hparams.n_layer_kv_from_start <= (int32_t) hparams.n_layer()) {
+            add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS, hparams.n_layer() - hparams.n_layer_kv_from_start);
+        }
+    }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);
@@ -403,6 +420,9 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->pos_embd);
     add_tensor(model->tok_norm);
     add_tensor(model->tok_norm_b);
+    add_tensor(model->per_layer_tok_embd);
+    add_tensor(model->per_layer_model_proj);
+    add_tensor(model->per_layer_proj_norm);
     add_tensor(model->output_norm);
     add_tensor(model->output_norm_b);
     add_tensor(model->output);

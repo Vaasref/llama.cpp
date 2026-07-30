@@ -230,6 +230,7 @@ measurement formats are rejected and must be regenerated.
 For non-uniform MoE models, the header expert count is the maximum across MoE layers.
 Blocks remain rectangular and routed IDs are validated against the actual count of their
 layer, so the per-token observation layout does not vary by layer.
+Per-layer `expert_count` arrays are supported for Mistral4, Qwen3.5/3.6 MoE, Granite 4 H, Gemma 4, and MiniMax-M2 GGUFs. Other architectures continue to require a scalar expert count.
 
 Measurements use a canonical model signature based on architecture, MoE metadata,
 tensor names, and logical tensor shapes. Storage types and shard placement are excluded, so

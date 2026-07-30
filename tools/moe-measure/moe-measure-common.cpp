@@ -126,13 +126,31 @@ bool get_u32_or_array(const gguf_context * ctx, const std::string & key, size_t 
         values.assign(count, value);
         return true;
     }
-    if (gguf_get_arr_n(ctx, id) != count || gguf_get_arr_type(ctx, id) != GGUF_TYPE_UINT32) {
+    if (gguf_get_arr_n(ctx, id) != count) {
         error = "unexpected GGUF array for key: " + key;
         return false;
     }
-    const uint32_t * data = static_cast<const uint32_t *>(gguf_get_arr_data(ctx, id));
-    values.assign(data, data + count);
-    return true;
+    const gguf_type array_type = gguf_get_arr_type(ctx, id);
+    if (array_type == GGUF_TYPE_UINT32) {
+        const uint32_t * data = static_cast<const uint32_t *>(gguf_get_arr_data(ctx, id));
+        values.assign(data, data + count);
+        return true;
+    }
+    if (array_type == GGUF_TYPE_INT32) {
+        const int32_t * data = static_cast<const int32_t *>(gguf_get_arr_data(ctx, id));
+        values.clear();
+        values.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            if (data[i] < 0) {
+                error = "negative GGUF array value for key: " + key;
+                return false;
+            }
+            values.push_back(static_cast<uint32_t>(data[i]));
+        }
+        return true;
+    }
+    error = "unexpected GGUF array type for key: " + key;
+    return false;
 }
 
 uint64_t measurement_header_size(const moe_measure_measurement_header & header) {
@@ -490,6 +508,13 @@ bool moe_measure_model_info_load(const std::string & path, moe_measure_model_inf
         ggml_free(meta0);
         return false;
     }
+    uint32_t n_nextn = 0;
+    if (!get_u32(gguf0.get(), info.architecture + ".nextn_predict_layers", n_nextn, false, error) ||
+        n_nextn >= info.n_layer) {
+        error = "model has invalid MTP/NextN layer metadata";
+        ggml_free(meta0);
+        return false;
+    }
     const int64_t split_count_key = gguf_find_key(gguf0.get(), LLM_KV_SPLIT_COUNT);
     if (split_count_key >= 0) {
         if (gguf_get_kv_type(gguf0.get(), split_count_key) != GGUF_TYPE_UINT16) {
@@ -552,6 +577,12 @@ bool moe_measure_model_info_load(const std::string & path, moe_measure_model_inf
     }
     info.signature = structure_hash;
     std::sort(info.moe_layers.begin(), info.moe_layers.end());
+    if (n_nextn > 0) {
+        const int32_t main_layer_count = static_cast<int32_t>(info.n_layer - n_nextn);
+        info.moe_layers.erase(
+            std::lower_bound(info.moe_layers.begin(), info.moe_layers.end(), main_layer_count),
+            info.moe_layers.end());
+    }
     if (info.moe_layers.empty()) {
         error = "model metadata contains no standard stacked expert tensors";
         return false;
@@ -562,6 +593,10 @@ bool moe_measure_model_info_load(const std::string & path, moe_measure_model_inf
             error = "model has invalid per-layer expert counts";
             return false;
         }
+    }
+    info.n_expert = 0;
+    for (int32_t layer : info.moe_layers) {
+        info.n_expert = std::max(info.n_expert, info.n_expert_per_layer[layer]);
     }
     return true;
 }
