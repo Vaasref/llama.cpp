@@ -95,6 +95,9 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+    if (hparams.no_output && !params.expert_output_capture_only) {
+        throw std::runtime_error("model was loaded without an output tensor and requires expert_output_capture_only");
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {

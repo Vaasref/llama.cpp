@@ -329,6 +329,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         model->hparams.vocab_only = params.vocab_only;
         model->hparams.no_alloc   = params.no_alloc;
+        model->hparams.no_output  = params.no_output;
 
         try {
             model->load_hparams(ml);
@@ -355,6 +356,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+        model->load_stats(ml);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
@@ -603,4 +605,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

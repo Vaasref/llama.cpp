@@ -10,6 +10,7 @@
 #include "llama-vocab.h"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
@@ -35,8 +36,15 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
     }
 }
 
+static gguf_context * llama_model_saver_init(const llama_model * model) {
+    if (model->hparams.no_output) {
+        throw std::runtime_error("cannot save a model loaded without an output tensor");
+    }
+    return gguf_init_empty();
+}
+
 llama_model_saver::llama_model_saver(const struct llama_model * model) :
-        gguf_ctx(gguf_init_empty()), gguf_ctx_owned(true), model(model), llm_kv(model->arch) {
+        gguf_ctx(llama_model_saver_init(model)), gguf_ctx_owned(true), model(model), llm_kv(model->arch) {
     GGML_ASSERT(llama_model_saver_supports_arch(model->arch));
 }
 

@@ -1515,7 +1515,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         // output scales
-        if (output && output->type == GGML_TYPE_NVFP4) {
+        if (hparams.no_output) {
+            output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
+            output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
+        } else if (output && output->type == GGML_TYPE_NVFP4) {
             // weight scale
             if (!output_s) {
                 output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
@@ -1525,6 +1528,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+    }
+    if (hparams.no_output && (tok_embd == nullptr || output != tok_embd)) {
+        throw std::runtime_error("model architecture cannot omit the output projection tensor");
     }
     ml.done_getting_tensors();
 
@@ -1541,7 +1547,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!hparams.no_output, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1680,10 +1686,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    if (params.no_output) {
+        const bool output_weight = tn.tensor == LLM_TENSOR_OUTPUT && !(flags & TENSOR_DUPLICATED) &&
+            tn.suffix && strcmp(tn.suffix, "weight") == 0;
+        const bool tied_output   = tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED);
+
+        if (output_weight) {
+            ggml_tensor * skipped = ml.create_tensor(
+                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list,
+                tn, ne, flags | TENSOR_SKIP | TENSOR_SKIP_PARTIAL);
+            GGML_ASSERT(skipped == nullptr);
+            LLAMA_LOG_INFO("%s: skipping output tensor %s\n", __func__, tn.str().c_str());
+            return tok_embd;
+        }
+        if (tied_output) {
+            return tok_embd;
+        }
+        if (tn.tensor == LLM_TENSOR_OUTPUT && tn.suffix &&
+                (strcmp(tn.suffix, "scale") == 0 || strcmp(tn.suffix, "input_scale") == 0)) {
+            return ml.create_tensor(
+                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list,
+                tn, ne, flags | TENSOR_SKIP | TENSOR_SKIP_PARTIAL);
+        }
+    }
+
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    ggml_tensor * result = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+    if (params.no_output && output == nullptr && tn.tensor == LLM_TENSOR_TOKEN_EMBD &&
+            !(flags & TENSOR_DUPLICATED) && tn.suffix && strcmp(tn.suffix, "weight") == 0) {
+        output = result;
+    }
+    return result;
 }
 
 std::string llama_model::arch_name() const {
@@ -1786,6 +1823,7 @@ void llama_model::print_info() const {
     LLAMA_LOG_INFO("%s: arch                  = %s\n",     __func__, arch_name().c_str());
     LLAMA_LOG_INFO("%s: vocab_only            = %d\n",     __func__, hparams.vocab_only);
     LLAMA_LOG_INFO("%s: no_alloc              = %d\n",     __func__, hparams.no_alloc);
+    LLAMA_LOG_INFO("%s: no_output             = %d\n",     __func__, hparams.no_output);
 
     if (!hparams.vocab_only) {
         LLAMA_LOG_INFO("%s: n_ctx_train           = %u\n",     __func__, hparams.n_ctx_train);
@@ -2362,6 +2400,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.no_output                   =*/ false,
     };
 
     return result;
@@ -2774,7 +2813,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_DUPLICATED     (llama_model_loader::TENSOR_DUPLICATED),
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
-    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL) {}
+    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
+    TENSOR_SKIP_PARTIAL   (llama_model_loader::TENSOR_SKIP_PARTIAL) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

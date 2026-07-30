@@ -140,6 +140,7 @@ pending contexts and load the full model once. Multimodal runs project a bounded
 contexts, unload the MMProj, load the full model to measure that group, and repeat. The
 MMProj and full model weights are not resident at the same time. The vocabulary-only
 model used for tokenization and templates remains loaded throughout.
+The full measurement model omits a separate token-logit output projector because capture-only evaluation ends before logits. Tied token embeddings remain loaded.
 
 The embedded model template is used by default. To use a specific Jinja2 file, pass
 `--jinja-template /path/to/template.jinja`. This reads the template, enables the Jinja

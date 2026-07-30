@@ -43,6 +43,7 @@ struct llama_hparams {
 
     bool vocab_only;
     bool no_alloc;
+    bool no_output;
     bool rope_finetuned;
     bool use_par_res;
     bool swin_norm;

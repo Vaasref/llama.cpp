@@ -2655,6 +2655,7 @@ int main(int argc, char ** argv) {
     LOG_INF("moe-measure: loading vocabulary-only model for preprocessing\n");
     llama_model_params vocab_model_params = common_model_params_to_llama(params);
     vocab_model_params.vocab_only         = true;
+    vocab_model_params.no_output          = false;
     llama_model_ptr vocab_model(llama_model_load_from_file(params.model.path.c_str(), vocab_model_params));
     if (!vocab_model) {
         LOG_ERR("error: failed to initialize vocabulary-only model\n");

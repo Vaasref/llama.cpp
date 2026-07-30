@@ -11,6 +11,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -352,6 +353,162 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+struct capture_only_result {
+    std::vector<float> values;
+    size_t model_bytes  = 0;
+    size_t output_bytes = 0;
+};
+
+static bool capture_only_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    if (strstr(tensor->name, "ffn_moe_expert_capture") == nullptr) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+
+    auto & values = *static_cast<std::vector<float> *>(user_data);
+    const size_t offset = values.size();
+    values.resize(offset + ggml_nelements(tensor));
+    ggml_backend_tensor_get(tensor, values.data() + offset, 0, ggml_nbytes(tensor));
+    return true;
+}
+
+static capture_only_result run_capture_only(
+        const llm_arch arch, bool moe, bool no_output, const size_t seed, bool non_uniform_experts = false) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, non_uniform_experts);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.no_output = no_output;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(
+        gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create capture-only model");
+    }
+
+    capture_only_result result;
+    for (const auto & entry : model->memory_breakdown()) {
+        result.model_bytes += entry.second;
+    }
+    if (!no_output) {
+        GGML_ASSERT(model->output != nullptr);
+        result.output_bytes = ggml_nbytes(model->output);
+    } else if (model->output != model->tok_embd) {
+        throw std::runtime_error("output tensor was not replaced by token embeddings");
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 0;
+    ctx_params.n_ubatch = 64;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.cb_eval = capture_only_callback;
+    ctx_params.cb_eval_user_data = &result.values;
+    ctx_params.expert_output_capture = true;
+    ctx_params.expert_output_capture_only = true;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx) {
+        throw std::runtime_error("failed to create capture-only context");
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(8, 128, seed);
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        common_batch_add(batch, tokens[i], i, {0}, true);
+    }
+    if (llama_decode(ctx.get(), batch) != 0 || llama_get_logits(ctx.get()) != nullptr) {
+        llama_batch_free(batch);
+        throw std::runtime_error("capture-only decode failed");
+    }
+    llama_batch_free(batch);
+
+    return result;
+}
+
+static bool test_no_output_capture(const size_t seed) {
+    const capture_only_result baseline = run_capture_only(LLM_ARCH_MISTRAL4, true, false, seed);
+    const capture_only_result partial  = run_capture_only(LLM_ARCH_MISTRAL4, true, true, seed);
+    if (baseline.values.empty() ||
+            baseline.values != partial.values ||
+            baseline.model_bytes < partial.model_bytes + baseline.output_bytes) {
+        fprintf(stderr, "capture mismatch: values=%zu/%zu equal=%d, bytes=%zu/%zu output=%zu\n",
+                baseline.values.size(), partial.values.size(), baseline.values == partial.values,
+                baseline.model_bytes, partial.model_bytes, baseline.output_bytes);
+        return false;
+    }
+
+    FILE * file = tmpfile();
+    if (file == nullptr) {
+        return false;
+    }
+    {
+        gguf_context_ptr source_gguf = get_gguf_ctx(LLM_ARCH_MISTRAL4, true);
+        llama_model_params source_params = llama_model_default_params();
+        size_t source_seed = seed;
+        llama_model_ptr source(llama_model_init_from_user(
+            source_gguf.get(), set_tensor_data, &source_seed, source_params));
+        if (!source) {
+            fclose(file);
+            return false;
+        }
+        llama_model_saver saver(source.get());
+        saver.add_kv_from_model();
+        saver.add_tensors_from_model();
+        saver.save(file);
+    }
+
+    rewind(file);
+    llama_model_params full_params = llama_model_default_params();
+    llama_model_ptr full_model(llama_model_load_from_file_ptr(file, full_params));
+    if (!full_model) {
+        fclose(file);
+        return false;
+    }
+    const uint64_t full_size = llama_model_size(full_model.get());
+    const uint64_t output_size = ggml_nbytes(full_model->output);
+    full_model.reset();
+
+    rewind(file);
+    llama_model_params partial_params = llama_model_default_params();
+    partial_params.no_output = true;
+    llama_model_ptr partial_model(llama_model_load_from_file_ptr(file, partial_params));
+    fclose(file);
+    if (!partial_model ||
+            partial_model->output != partial_model->tok_embd ||
+            llama_model_size(partial_model.get()) + output_size != full_size) {
+        return false;
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MISTRAL4, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.no_output = true;
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(
+        gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    if (!model) {
+        return false;
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    llama_context_ptr invalid_ctx(llama_init_from_model(model.get(), ctx_params));
+    if (invalid_ctx) {
+        return false;
+    }
+
+    try {
+        llama_model_saver saver(model.get());
+        GGML_UNUSED(saver);
+        return false;
+    } catch (const std::runtime_error &) {
+    }
+
+    const capture_only_result tied     = run_capture_only(LLM_ARCH_GEMMA2, false, true, seed);
+    const capture_only_result deferred = run_capture_only(LLM_ARCH_GEMMA4, false, true, seed);
+    return tied.values.empty() && deferred.values.empty();
 }
 
 #ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
@@ -906,6 +1063,10 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if ((arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_MISTRAL4) && !test_no_output_capture(seed)) {
+            fprintf(stderr, "no-output capture test failed\n");
+            return 1;
         }
 #ifdef LLAMA_EXP_MOE_ROUTING_TEMPERATURE
         if (!test_moe_routing_temperature_matrix()) {

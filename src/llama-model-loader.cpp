@@ -1097,9 +1097,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (!(flags & TENSOR_SKIP_PARTIAL)) {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
-            size_data -= nbytes;
+            if (!files.empty()) {
+                size_data -= nbytes;
+                if (flags & TENSOR_SKIP_PARTIAL) {
+                    n_bytes -= nbytes;
+                    n_elements -= ggml_nelements(t_meta);
+                }
+            }
             n_created++;
 
             return nullptr;
@@ -1207,11 +1215,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     if (files.empty()) {
+        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+        if ((flags & TENSOR_SKIP) && tid == -1) {
+            return nullptr;
+        }
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
         ggml_type type = GGML_TYPE_F32;
-        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
         }
@@ -1237,7 +1248,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) {
+            return nullptr;
+        }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());

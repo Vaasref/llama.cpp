@@ -1,5 +1,6 @@
 #include "moe-measure-scheduler.h"
 
+#include "common.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -21,6 +22,13 @@ void require(bool condition, const char * expression, int line) {
 }  // namespace
 
 int main() {
+    const llama_model_params default_model_params = llama_model_default_params();
+    REQUIRE(!default_model_params.no_output);
+
+    common_params capture_params;
+    capture_params.expert_output_capture_only = true;
+    REQUIRE(common_model_params_to_llama(capture_params).no_output);
+
     const llama_context_params default_context_params = llama_context_default_params();
     REQUIRE(!default_context_params.expert_output_capture);
     REQUIRE(!default_context_params.expert_output_capture_only);
